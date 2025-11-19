@@ -14,3 +14,4 @@ This repository treats the Gherkin feature files in `features/` as the source of
 - Implement the CLI so it fulfills the scenarios exactly. Treat the scenarios as high-level tests: every step should map to a concrete CLI behavior (argument parsing, ffmpeg invocation, error message, etc.).
 - Keep the metadata command as the current priority. Chunking is aspirational but already scoped in `features/audio_chunking.feature`; use it to drive future stories.
 - If there’s ever a disagreement between documentation and feature files, defer to the feature files—they capture the committed requirements.
+- Prefer the official OpenAI client libraries (e.g., `async-openai`) when integrating with the API so the CLI stays aligned with platform changes.

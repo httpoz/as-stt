@@ -6,6 +6,7 @@ Feature: Audio chunking for OpenAI STT uploads
   Scenario: Creating sequential 25 MB chunks
     Given a source audio file larger than 25 megabytes
     When I run `audio_splitter_cli chunk recording.m4a --max-size 25MB`
+    And the CLI queries ffprobe for duration and bitrate metadata
     Then the CLI emits sequential files no larger than 25 megabytes each
     And each chunk filename includes the original name and a numeric index
     And the final chunk is allowed to be smaller than 25 megabytes so the entire recording is preserved
@@ -13,8 +14,8 @@ Feature: Audio chunking for OpenAI STT uploads
   Scenario: Calculating chunk boundaries from metadata
     Given ffmpeg reports a duration of 3600 seconds and a bitrate of 228 kb/s
     When I calculate the chunk plan for a 25 megabyte limit
-    Then I get chunk windows at 0s, 919s, 1838s, and 2757s
-    And the final chunk covers the remaining 843 seconds of audio
+    Then I get chunk windows at 0s, 864s, 1728s, 2592s, and 3456s
+    And the final chunk covers the remaining 144 seconds of audio
 
   Scenario: Rejecting inputs that are already below the threshold
     Given a source audio file smaller than 25 megabytes
