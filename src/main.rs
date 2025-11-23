@@ -133,10 +133,15 @@ fn chunk_audio(input: &Path, max_size_mb: f64) -> Result<()> {
 }
 
 const MAX_CHUNK_BYTES: u64 = 25 * 1024 * 1024;
+const OPENAI_MAX_TRANSCRIPTION_DURATION_SECONDS: f64 = 1400.0;
+const CHUNK_DURATION_BUFFER_SECONDS: f64 = 100.0;
+const PLANNED_MAX_CHUNK_DURATION_SECONDS: f64 =
+    OPENAI_MAX_TRANSCRIPTION_DURATION_SECONDS - CHUNK_DURATION_BUFFER_SECONDS;
 
 fn transcribe_chunk(input: &Path) -> Result<()> {
     ensure_input_exists(input)?;
     ensure_chunk_within_limit(input)?;
+    ensure_chunk_duration_within_limit(input)?;
     let api_key = load_openai_api_key()?;
     let transcript = transcribe_chunk_with_openai(input, api_key)?;
 
@@ -162,6 +167,18 @@ fn ensure_chunk_within_limit(path: &Path) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn ensure_chunk_duration_within_limit(path: &Path) -> Result<()> {
+    let metadata = fetch_audio_metadata(path)?;
+    if metadata.duration_seconds > OPENAI_MAX_TRANSCRIPTION_DURATION_SECONDS {
+        bail!(
+            "chunk '{}' is longer than the {} second limit for transcription",
+            path.to_string_lossy(),
+            OPENAI_MAX_TRANSCRIPTION_DURATION_SECONDS as u32
+        );
+    }
     Ok(())
 }
 
@@ -322,7 +339,8 @@ pub fn calculate_chunk_plan(
     let max_bits_per_chunk = max_size_mb * 1024.0 * 1024.0 * 8.0;
     // Use a conservative margin so container overhead cannot push a chunk past the limit.
     let safe_bits_per_chunk = max_bits_per_chunk * SAFETY_MARGIN;
-    let chunk_duration = (safe_bits_per_chunk / bits_per_second).floor();
+    let bits_based_duration = (safe_bits_per_chunk / bits_per_second).floor();
+    let chunk_duration = bits_based_duration.min(PLANNED_MAX_CHUNK_DURATION_SECONDS);
 
     if chunk_duration < 1.0 {
         bail!("calculated chunk duration is less than one second; adjust inputs");
@@ -361,5 +379,15 @@ mod tests {
         assert!(calculate_chunk_plan(0.0, 228.0, 25.0).is_err());
         assert!(calculate_chunk_plan(10.0, 0.0, 25.0).is_err());
         assert!(calculate_chunk_plan(10.0, 228.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn caps_chunk_duration_at_transcription_limit() {
+        let plan = calculate_chunk_plan(4000.0, 128.0, 25.0).unwrap();
+        assert_eq!(plan.len(), 4);
+        assert!((plan[0].1 - 1300.0).abs() < 1e-6);
+        assert!((plan[1].1 - 1300.0).abs() < 1e-6);
+        assert!((plan[2].1 - 1300.0).abs() < 1e-6);
+        assert!((plan[3].1 - 100.0).abs() < 1e-6);
     }
 }
