@@ -30,3 +30,17 @@ Feature: Audio chunking for OpenAI STT uploads
     When I run `audio_splitter_cli chunk short.m4a --max-size 25MB`
     Then the CLI exits with status code 0
     And it returns a single chunk identical to the input file
+
+  Scenario: Splitting a compliant chunk into equal parts
+    Given I have a chunk file `session_chunk001.m4a` that is ≤25 megabytes and ≤1400 seconds
+    When I run `audio_splitter_cli split session_chunk001.m4a --parts 3`
+    Then the CLI divides the chunk duration into three sequential windows
+    And it emits `session_chunk001_part001.m4a`, `session_chunk001_part002.m4a`, and `session_chunk001_part003.m4a`
+    And the final part includes any remaining audio so the entire chunk is preserved
+    And the CLI verifies each resulting part stays within the 25 megabyte and 1400 second limits
+
+  Scenario: Splitting rejects oversized inputs with a helpful instruction
+    Given I have an audio file larger than 25 megabytes
+    When I run `audio_splitter_cli split long_recording.m4a --parts 2`
+    Then the CLI aborts
+    And it tells me to run `audio_splitter_cli chunk long_recording.m4a` first so the file complies with the limits

@@ -33,6 +33,14 @@ enum Commands {
         #[arg(long, default_value_t = 25.0)]
         max_size_mb: f64,
     },
+    /// Split an already compliant chunk into N sequential parts
+    Split {
+        /// Chunk to split further
+        input: PathBuf,
+        /// Number of parts to create
+        #[arg(long)]
+        parts: usize,
+    },
     /// Transcribe a chunked audio file using OpenAI
     Transcribe {
         /// Audio chunk to transcribe
@@ -46,6 +54,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Inspect { input } => inspect_audio(&input),
         Commands::Chunk { input, max_size_mb } => chunk_audio(&input, max_size_mb),
+        Commands::Split { input, parts } => split_chunk(&input, parts),
         Commands::Transcribe { input } => transcribe_chunk(&input),
     }
 }
@@ -132,6 +141,69 @@ fn chunk_audio(input: &Path, max_size_mb: f64) -> Result<()> {
     Ok(())
 }
 
+fn split_chunk(input: &Path, parts: usize) -> Result<()> {
+    if parts < 2 {
+        bail!("parts must be at least 2");
+    }
+
+    ensure_input_exists(input)?;
+    let metadata = fetch_audio_metadata(input)?;
+    ensure_chunk_ready_for_split(input, metadata.duration_seconds)?;
+
+    let plan = calculate_equal_split_plan(metadata.duration_seconds, parts)?;
+
+    let parent = input.parent().unwrap_or_else(|| Path::new("."));
+    let base_name = input
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
+        .unwrap_or_else(|| "chunk".to_string());
+    let extension = input
+        .extension()
+        .map(|ext| format!(".{}", ext.to_string_lossy()))
+        .unwrap_or_default();
+
+    for (index, (start, duration)) in plan.iter().enumerate() {
+        let human_index = index + 1;
+        let output_name = format!("{base_name}_part{human_index:03}{extension}");
+        let output_path = parent.join(&output_name);
+        let start_arg = format!("{start:.3}");
+        let duration_arg = format!("{duration:.3}");
+
+        let status = Command::new("ffmpeg")
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-y")
+            .arg("-i")
+            .arg(input)
+            .arg("-ss")
+            .arg(&start_arg)
+            .arg("-t")
+            .arg(&duration_arg)
+            .arg("-c")
+            .arg("copy")
+            .arg(&output_path)
+            .status()
+            .with_context(|| format!("failed to split file while creating {output_name}"))?;
+
+        if !status.success() {
+            bail!("ffmpeg failed to create {output_name}");
+        }
+
+        ensure_chunk_within_limit(&output_path)
+            .with_context(|| format!("{output_name} exceeded the 25 MB limit"))?;
+        ensure_chunk_duration_within_limit(&output_path)
+            .with_context(|| format!("{output_name} exceeded the 1400 second limit"))?;
+
+        println!(
+            "Created {output_name} (start: {:.3}s, duration: {:.3}s)",
+            start, duration
+        );
+    }
+
+    Ok(())
+}
+
 const MAX_CHUNK_BYTES: u64 = 25 * 1024 * 1024;
 const OPENAI_MAX_TRANSCRIPTION_DURATION_SECONDS: f64 = 1400.0;
 const CHUNK_DURATION_BUFFER_SECONDS: f64 = 100.0;
@@ -179,6 +251,24 @@ fn ensure_chunk_duration_within_limit(path: &Path) -> Result<()> {
             OPENAI_MAX_TRANSCRIPTION_DURATION_SECONDS as u32
         );
     }
+    Ok(())
+}
+
+fn ensure_chunk_ready_for_split(path: &Path, duration_seconds: f64) -> Result<()> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for '{}'", path.display()))?;
+
+    if metadata.len() > MAX_CHUNK_BYTES
+        || duration_seconds > OPENAI_MAX_TRANSCRIPTION_DURATION_SECONDS
+    {
+        let display = path.to_string_lossy();
+        bail!(
+            "input '{}' exceeds the chunk limits; run `audio_splitter_cli chunk {}` first",
+            display,
+            display
+        );
+    }
+
     Ok(())
 }
 
@@ -318,6 +408,31 @@ struct FfprobeFormat {
     bit_rate: Option<String>,
 }
 
+fn calculate_equal_split_plan(duration_seconds: f64, parts: usize) -> Result<Vec<(f64, f64)>> {
+    if duration_seconds <= 0.0 {
+        bail!("duration_seconds must be greater than zero");
+    }
+    if parts < 2 {
+        bail!("parts must be at least 2");
+    }
+
+    let mut plan = Vec::with_capacity(parts);
+    let mut start = 0.0;
+    for i in 0..parts {
+        let remaining = duration_seconds - start;
+        let segments_left = parts - i;
+        let duration = if segments_left == 1 {
+            remaining
+        } else {
+            remaining / segments_left as f64
+        };
+        plan.push((start, duration));
+        start += duration;
+    }
+
+    Ok(plan)
+}
+
 /// Calculate start timestamps and durations so each chunk stays within the maximum size (in megabytes).
 pub fn calculate_chunk_plan(
     duration_seconds: f64,
@@ -360,7 +475,7 @@ pub fn calculate_chunk_plan(
 
 #[cfg(test)]
 mod tests {
-    use super::calculate_chunk_plan;
+    use super::{calculate_chunk_plan, calculate_equal_split_plan};
 
     #[test]
     fn splits_into_expected_chunk_lengths() {
@@ -389,5 +504,23 @@ mod tests {
         assert!((plan[1].1 - 1300.0).abs() < 1e-6);
         assert!((plan[2].1 - 1300.0).abs() < 1e-6);
         assert!((plan[3].1 - 100.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn split_plan_divides_duration_evenly_with_remainder() {
+        let plan = calculate_equal_split_plan(100.0, 3).unwrap();
+        assert_eq!(plan.len(), 3);
+        assert!((plan[0].0 - 0.0).abs() < 1e-6);
+        assert!((plan[0].1 - (100.0 / 3.0)).abs() < 1e-6);
+        assert!((plan[1].0 - (100.0 / 3.0)).abs() < 1e-6);
+        assert!((plan[1].1 - (100.0 / 3.0)).abs() < 1e-6);
+        assert!((plan[2].0 - (200.0 / 3.0)).abs() < 1e-6);
+        assert!((plan[2].1 - (100.0 - (200.0 / 3.0))).abs() < 1e-6);
+    }
+
+    #[test]
+    fn split_plan_rejects_invalid_requests() {
+        assert!(calculate_equal_split_plan(0.0, 3).is_err());
+        assert!(calculate_equal_split_plan(10.0, 1).is_err());
     }
 }
