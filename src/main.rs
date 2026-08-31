@@ -95,50 +95,7 @@ fn chunk_audio(input: &Path, max_size_mb: f64) -> Result<()> {
         max_size_mb,
     )?;
 
-    let parent = input.parent().unwrap_or_else(|| Path::new("."));
-    let base_name = input
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().to_string())
-        .unwrap_or_else(|| "chunk".to_string());
-    let extension = input
-        .extension()
-        .map(|ext| format!(".{}", ext.to_string_lossy()))
-        .unwrap_or_default();
-
-    for (index, (start, duration)) in plan.iter().enumerate() {
-        let output_name = format!("{base_name}_chunk{index:03}{extension}");
-        let output_path = parent.join(&output_name);
-        let start_arg = format!("{start:.3}");
-        let duration_arg = format!("{duration:.3}");
-
-        let status = Command::new("ffmpeg")
-            .arg("-hide_banner")
-            .arg("-loglevel")
-            .arg("error")
-            .arg("-y")
-            .arg("-i")
-            .arg(input)
-            .arg("-ss")
-            .arg(&start_arg)
-            .arg("-t")
-            .arg(&duration_arg)
-            .arg("-c")
-            .arg("copy")
-            .arg(&output_path)
-            .status()
-            .with_context(|| format!("failed to chunk file while creating {output_name}"))?;
-
-        if !status.success() {
-            bail!("ffmpeg failed to create {output_name}");
-        }
-
-        println!(
-            "Created {output_name} (start: {:.3}s, duration: {:.3}s)",
-            start, duration
-        );
-    }
-
-    Ok(())
+    write_plan_segments(input, &plan, "chunk", 0, |_path, _name| Ok(()))
 }
 
 fn split_chunk(input: &Path, parts: usize) -> Result<()> {
@@ -152,6 +109,24 @@ fn split_chunk(input: &Path, parts: usize) -> Result<()> {
 
     let plan = calculate_equal_split_plan(metadata.duration_seconds, parts)?;
 
+    write_plan_segments(input, &plan, "part", 1, |output_path, output_name| {
+        ensure_chunk_within_limit(output_path)
+            .with_context(|| format!("{output_name} exceeded the 25 MB limit"))?;
+        ensure_chunk_duration_within_limit(output_path)
+            .with_context(|| format!("{output_name} exceeded the 1400 second limit"))?;
+        Ok(())
+    })
+}
+
+/// Cut `input` into segments per `plan` using ffmpeg, naming each `<stem>_<label><index><ext>`.
+/// `post_process` runs after each segment is written (e.g. to validate size/duration limits).
+fn write_plan_segments(
+    input: &Path,
+    plan: &[(f64, f64)],
+    label: &str,
+    start_index: usize,
+    mut post_process: impl FnMut(&Path, &str) -> Result<()>,
+) -> Result<()> {
     let parent = input.parent().unwrap_or_else(|| Path::new("."));
     let base_name = input
         .file_stem()
@@ -162,9 +137,9 @@ fn split_chunk(input: &Path, parts: usize) -> Result<()> {
         .map(|ext| format!(".{}", ext.to_string_lossy()))
         .unwrap_or_default();
 
-    for (index, (start, duration)) in plan.iter().enumerate() {
-        let human_index = index + 1;
-        let output_name = format!("{base_name}_part{human_index:03}{extension}");
+    for (offset, (start, duration)) in plan.iter().enumerate() {
+        let index = start_index + offset;
+        let output_name = format!("{base_name}_{label}{index:03}{extension}");
         let output_path = parent.join(&output_name);
         let start_arg = format!("{start:.3}");
         let duration_arg = format!("{duration:.3}");
@@ -184,16 +159,13 @@ fn split_chunk(input: &Path, parts: usize) -> Result<()> {
             .arg("copy")
             .arg(&output_path)
             .status()
-            .with_context(|| format!("failed to split file while creating {output_name}"))?;
+            .with_context(|| format!("failed to create {output_name}"))?;
 
         if !status.success() {
             bail!("ffmpeg failed to create {output_name}");
         }
 
-        ensure_chunk_within_limit(&output_path)
-            .with_context(|| format!("{output_name} exceeded the 25 MB limit"))?;
-        ensure_chunk_duration_within_limit(&output_path)
-            .with_context(|| format!("{output_name} exceeded the 1400 second limit"))?;
+        post_process(&output_path, &output_name)?;
 
         println!(
             "Created {output_name} (start: {:.3}s, duration: {:.3}s)",
